@@ -1,0 +1,183 @@
+name: Build desktop apps
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      core_version:
+        description: Official CLIProxyAPI release tag, or latest
+        default: latest
+        type: string
+      panel_version:
+        description: Official management UI release tag, or latest
+        default: latest
+        type: string
+      publish:
+        description: Publish a GitHub release after all native builds pass
+        default: false
+        type: boolean
+  schedule:
+    - cron: '23 6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Check formatting and shared behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l .)"
+          go test ./...
+          go vet ./...
+          go build -o build/desktop ./cmd/desktop
+          go build -o build/cli-proxy-supervisor ./cmd/supervisor
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Resolve official release versions once for all targets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_VERSION: ${{ inputs.core_version || 'latest' }}
+          PANEL_VERSION: ${{ inputs.panel_version || 'latest' }}
+        run: python3 scripts/upstream.py resolve --core "$CORE_VERSION" --panel "$PANEL_VERSION" --output build/upstream.json
+      - name: Record wrapper and dependency versions
+        id: metadata
+        env:
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          version = pathlib.Path('VERSION').read_text().strip()
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('VERSION must contain three numeric components')
+          manifest = json.loads(pathlib.Path('build/upstream.json').read_text())
+          tag = f"desktop-v{version}-core-{manifest['core']['tag']}-ui-{manifest['panel']['tag']}"
+          if os.environ['IS_TAG'] == 'true':
+              if os.environ['REF_NAME'] != 'v' + version:
+                  raise SystemExit('The pushed version tag must match VERSION')
+              tag = os.environ['REF_NAME']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\nrelease_tag={tag}\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-manifest
+          path: build/upstream.json
+          if-no-files-found: error
+
+  native:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-amd64
+            runner: windows-latest
+          - target: windows-arm64
+            runner: windows-11-arm
+          - target: darwin-amd64
+            runner: macos-15-intel
+          - target: darwin-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-manifest
+          path: build
+      - name: Run native regression tests
+        run: go test ./...
+      - name: Package and smoke-test the actual official executable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MACOS_CERT_P12_B64: ${{ secrets.MACOS_CERT_P12_B64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          WINDOWS_SIGN_PFX_B64: ${{ secrets.WINDOWS_SIGN_PFX_B64 }}
+          WINDOWS_SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
+        run: python scripts/package.py --target ${{ matrix.target }} --manifest build/upstream.json --version ${{ needs.prepare.outputs.version }}
+      - name: Preserve native failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-${{ matrix.target }}
+          path: build/**/logs/*.log
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: [prepare, native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare checksums and release notes
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          dist = pathlib.Path('dist')
+          packages = sorted(p for p in dist.iterdir() if p.suffix in ('.zip', '.dmg'))
+          reports = [json.loads(p.read_text()) for p in dist.glob('*.json')]
+          if len(packages) != 4 or len(reports) != 4:
+              raise SystemExit('All four tested native packages are required')
+          (dist / 'checksums.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in packages))
+          upstream = reports[0]['upstream']
+          notes = [f"Bundles official CLIProxyAPI **{upstream['core']['tag']}** and management UI **{upstream['panel']['tag']}**.", '',
+                   'Extract the Windows ZIP and run CLIProxyAPI Desktop.exe, or copy the macOS app from the DMG to Applications.', '',
+                   '| Target | Code signed | Notarized |', '|---|---|---|']
+          for report in sorted(reports, key=lambda r: r['target']):
+              notes.append(f"| {report['target']} | {report['signed']} | {report['notarized']} |")
+          notes += ['', 'Unsigned macOS builds require explicit approval in System Settings → Privacy & Security. Developer ID signed and notarized builds are recommended for distribution.', '',
+                    'Configuration and credentials stay in your per-user CLIProxyAPI data directory when upgrading. Bundled dependency versions and hashes are included in each JSON build report.']
+          pathlib.Path('release-notes.md').write_text('\n'.join(notes) + '\n')
+          PY
+      - name: Publish tested packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          TARGET_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" dist/* --repo "$GH_REPO" --target "$TARGET_COMMIT" --title "CLIProxyAPI Desktop $RELEASE_TAG" --notes-file release-notes.md

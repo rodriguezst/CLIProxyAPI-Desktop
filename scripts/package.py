@@ -1,0 +1,214 @@
+"""Build native launchers, test the bundled server, and create desktop packages."""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import plistlib
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+import upstream
+
+
+def run(args, **kwargs):
+    # Do not include command arguments in exceptions: signing commands contain secrets.
+    result = subprocess.run([str(a) for a in args], **kwargs)
+    if result.returncode:
+        raise RuntimeError(f"{Path(str(args[0])).name} failed with exit code {result.returncode}")
+    return result
+
+
+def smoke(launcher):
+    with tempfile.TemporaryDirectory(prefix="CPA smoke with spaces ") as directory:
+        try:
+            run([launcher, "--smoke-test", "--data-dir", directory], timeout=100)
+        except (RuntimeError, subprocess.TimeoutExpired):
+            log = Path(directory) / "logs" / "server.log"
+            if log.exists():
+                # The isolated test uses generated credentials and no provider accounts.
+                print(log.read_text(encoding="utf-8", errors="replace")[-12000:])
+            raise
+        # The server's listener must have been released by the helper.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 8317))
+
+
+def build(target, manifest, version):
+    goos, arch = target.split("-", 1)
+    native_os = {"Windows": "windows", "Darwin": "darwin", "Linux": "linux"}[platform.system()]
+    native_arch = {"x86_64": "amd64", "AMD64": "amd64", "arm64": "arm64", "aarch64": "arm64", "ARM64": "arm64"}[platform.machine()]
+    if (goos, arch) != (native_os, native_arch):
+        raise ValueError("package.py must run on the target's native OS and architecture")
+    work = ROOT / "build" / target
+    if work.exists():
+        shutil.rmtree(work)
+    inputs = work / "inputs"
+    upstream.download(manifest, target, inputs)
+    app = work / "CLIProxyAPI Desktop.app" if goos == "darwin" else work / "CLIProxyAPI Desktop"
+    binary = app / "Contents" / "MacOS" if goos == "darwin" else app
+    resources = app / "Contents" / "Resources" if goos == "darwin" else app / "resources"
+    binary.mkdir(parents=True)
+    shutil.copytree(inputs, resources)
+    suffix = ".exe" if goos == "windows" else ""
+    if goos == "darwin":
+        shutil.move(resources / "cli-proxy-api", binary / "cli-proxy-api")
+    launcher = binary / ("CLIProxyAPI Desktop" + suffix)
+    helper = binary / ("cli-proxy-supervisor" + suffix)
+    env = dict(os.environ, GOOS=goos, GOARCH=arch, CGO_ENABLED="1" if goos == "darwin" else "0")
+    flags = f"-s -w -X main.version={version}"
+    if goos == "windows":
+        flags += " -H=windowsgui"
+    run(["go", "build", "-trimpath", "-ldflags", flags, "-o", launcher, "./cmd/desktop"], cwd=ROOT, env=env)
+    run(["go", "build", "-trimpath", "-ldflags", "-s -w", "-o", helper, "./cmd/supervisor"], cwd=ROOT, env=env)
+    shutil.copy2(ROOT / "LICENSE", resources / "licenses" / "Desktop-LICENSE.txt")
+    # Include exact third-party module license files, including transitive modules.
+    result = run(["go", "list", "-m", "-json", "all"], cwd=ROOT, capture_output=True, text=True)
+    decoder, tail = json.JSONDecoder(), result.stdout
+    while tail.strip():
+        module, offset = decoder.raw_decode(tail.lstrip())
+        tail = tail.lstrip()[offset:]
+        if module.get("Main") or not module.get("Dir"):
+            continue
+        for filename in ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "NOTICE"):
+            source = Path(module["Dir"]) / filename
+            if source.is_file():
+                name = module["Path"].replace("/", "_") + "-" + filename
+                shutil.copy2(source, resources / "licenses" / name)
+    (resources / "build-info.txt").write_text(
+        f"CLIProxyAPI: {manifest['core']['tag']}\nManagement UI: {manifest['panel']['tag']}\nTarget: {target}\n", encoding="utf-8")
+    if goos == "darwin":
+        plist = plistlib.loads((ROOT / "packaging/macos/Info.plist").read_bytes())
+        plist["CFBundleShortVersionString"] = version
+        plist["CFBundleVersion"] = os.environ.get("GITHUB_RUN_NUMBER", "1")
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps(plist))
+        png = work / "icon.png"
+        run(["go", "run", "./cmd/icon", "--out", png], cwd=ROOT)
+        iconset = work / "AppIcon.iconset"
+        iconset.mkdir()
+        for size in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                name = f"icon_{size}x{size}" + ("@2x" if scale == 2 else "") + ".png"
+                run(["sips", "-z", size * scale, size * scale, png, "--out", iconset / name], stdout=subprocess.DEVNULL)
+        run(["iconutil", "-c", "icns", iconset, "-o", resources / "AppIcon.icns"])
+    return app, binary, launcher
+
+
+def sign_mac(app, binary):
+    identity = os.environ.get("MACOS_SIGN_IDENTITY", "")
+    cert = os.environ.get("MACOS_CERT_P12_B64", "")
+    if bool(identity) != bool(cert):
+        raise ValueError("MACOS_SIGN_IDENTITY and MACOS_CERT_P12_B64 must be configured together")
+    with tempfile.TemporaryDirectory() as temp:
+        keychain = Path(temp) / "build.keychain-db"
+        if identity:
+            password = secrets.token_hex(24)
+            p12 = Path(temp) / "sign.p12"
+            p12.write_bytes(base64.b64decode(cert))
+            run(["security", "create-keychain", "-p", password, keychain])
+            run(["security", "set-keychain-settings", "-lut", "21600", keychain])
+            run(["security", "unlock-keychain", "-p", password, keychain])
+            run(["security", "import", p12, "-k", keychain, "-P", os.environ.get("MACOS_CERT_PASSWORD", ""), "-T", "/usr/bin/codesign"])
+            run(["security", "set-key-partition-list", "-S", "apple-tool:,apple:", "-s", "-k", password, keychain], stdout=subprocess.DEVNULL)
+        try:
+            for item in (binary / "cli-proxy-api", binary / "cli-proxy-supervisor", binary / "CLIProxyAPI Desktop", app):
+                args = ["codesign", "--force", "--sign", identity or "-"]
+                if identity:
+                    args += ["--keychain", keychain, "--options", "runtime", "--timestamp"]
+                    if item.name == "cli-proxy-api":
+                        args += ["--entitlements", ROOT / "packaging/macos/core-entitlements.plist"]
+                run(args + [item])
+            run(["codesign", "--verify", "--deep", "--strict", app])
+        finally:
+            if identity:
+                run(["security", "delete-keychain", keychain])
+    return bool(identity)
+
+
+def notarize(path):
+    credentials = [os.environ.get(key) for key in ("APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD")]
+    if not all(credentials):
+        raise ValueError("notarization requires APPLE_ID, APPLE_TEAM_ID and APPLE_APP_PASSWORD")
+    run(["xcrun", "notarytool", "submit", path, "--apple-id", credentials[0], "--team-id", credentials[1], "--password", credentials[2], "--wait"])
+
+
+def sign_windows(app):
+    cert = os.environ.get("WINDOWS_SIGN_PFX_B64", "")
+    if not cert:
+        return False
+    candidates = list(Path("C:/Program Files (x86)/Windows Kits/10/bin").glob("*/arm64/signtool.exe" if platform.machine().lower() == "arm64" else "*/x64/signtool.exe"))
+    tool = shutil.which("signtool") or (str(sorted(candidates)[-1]) if candidates else None)
+    if not tool:
+        raise ValueError("Windows signing requires signtool from the Windows SDK")
+    with tempfile.TemporaryDirectory() as temp:
+        pfx = Path(temp) / "sign.pfx"
+        pfx.write_bytes(base64.b64decode(cert))
+        for executable in app.rglob("*.exe"):
+            run([tool, "sign", "/f", pfx, "/p", os.environ.get("WINDOWS_SIGN_PASSWORD", ""), "/fd", "SHA256", "/tr", "http://timestamp.digicert.com", "/td", "SHA256", executable])
+    return True
+
+
+def package(target, manifest, version):
+    if not re_version(version):
+        raise ValueError("VERSION must have three numeric components")
+    app, binary, launcher = build(target, manifest, version)
+    signed = sign_mac(app, binary) if target.startswith("darwin-") else sign_windows(app) if target.startswith("windows-") else False
+    smoke(launcher)
+    dist = ROOT / "dist"
+    dist.mkdir(exist_ok=True)
+    name = f"CLIProxyAPI-Desktop_{version}_core-{manifest['core']['tag']}_ui-{manifest['panel']['tag']}_{target}"
+    notarized = False
+    if target.startswith("darwin-"):
+        if signed:
+            archive = app.parent / "notarize.zip"
+            run(["ditto", "-c", "-k", "--keepParent", app, archive])
+            notarize(archive)
+            run(["xcrun", "stapler", "staple", app])
+        dmg_root = app.parent / "dmg-root"
+        dmg_root.mkdir()
+        shutil.copytree(app, dmg_root / app.name, symlinks=True)
+        (dmg_root / "Applications").symlink_to("/Applications")
+        artifact = dist / (name + ".dmg")
+        run(["hdiutil", "create", "-volname", "CLIProxyAPI Desktop", "-srcfolder", dmg_root, "-ov", "-format", "UDZO", artifact])
+        if signed:
+            notarize(artifact)
+            run(["xcrun", "stapler", "staple", artifact])
+            notarized = True
+    else:
+        artifact = dist / (name + ".zip")
+        with zipfile.ZipFile(artifact, "w", zipfile.ZIP_DEFLATED) as archive:
+            for file in app.rglob("*"):
+                if file.is_file():
+                    archive.write(file, file.relative_to(app.parent))
+    report = {"wrapper": version, "target": target, "upstream": manifest, "signed": signed,
+              "notarized": notarized, "artifact": artifact.name, "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+    (dist / (name + ".json")).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(f"Created {artifact.name}; signed={signed}, notarized={notarized}")
+
+
+def re_version(value):
+    import re
+    return re.fullmatch(r"\d+\.\d+\.\d+", value)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--manifest", type=Path, default=ROOT / "build/upstream.json")
+    parser.add_argument("--version", default=(ROOT / "VERSION").read_text().strip())
+    args = parser.parse_args()
+    try:
+        package(args.target, json.loads(args.manifest.read_text(encoding="utf-8")), args.version)
+    except Exception as error:
+        print(f"Packaging failed: {error}", file=sys.stderr)
+        sys.exit(1)
