@@ -124,7 +124,7 @@ func (l Listener) Address() string { return net.JoinHostPort(l.Host, strconv.Ito
 
 func (l Listener) BaseURL() string {
 	host := l.Host
-	if host == "" || host == "0.0.0.0" || host == "localhost" {
+	if host == "" || host == "0.0.0.0" {
 		host = "127.0.0.1"
 	} else if host == "::" {
 		host = "::1"

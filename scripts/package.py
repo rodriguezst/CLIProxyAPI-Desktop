@@ -38,6 +38,7 @@ def smoke(launcher):
             if log.exists():
                 # The isolated test uses generated credentials and no provider accounts.
                 print(log.read_text(encoding="utf-8", errors="replace")[-12000:])
+                shutil.copy2(log, ROOT / "build" / "smoke-failure.log")
             raise
         # The server's listener must have been released by the helper.
         with socket.socket() as probe:
@@ -66,6 +67,8 @@ def build(target, manifest, version):
     launcher = binary / ("CLIProxyAPI Desktop" + suffix)
     helper = binary / ("cli-proxy-supervisor" + suffix)
     env = dict(os.environ, GOOS=goos, GOARCH=arch, CGO_ENABLED="1" if goos == "darwin" else "0")
+    if goos == "darwin":
+        env["MACOSX_DEPLOYMENT_TARGET"] = "12.0"
     flags = f"-s -w -X main.version={version}"
     if goos == "windows":
         flags += " -H=windowsgui"
@@ -109,6 +112,8 @@ def sign_mac(app, binary):
     cert = os.environ.get("MACOS_CERT_P12_B64", "")
     if bool(identity) != bool(cert):
         raise ValueError("MACOS_SIGN_IDENTITY and MACOS_CERT_P12_B64 must be configured together")
+    if identity and not all(os.environ.get(key) for key in ("APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD")):
+        raise ValueError("Developer ID signing requires all Apple notarization credentials")
     with tempfile.TemporaryDirectory() as temp:
         keychain = Path(temp) / "build.keychain-db"
         if identity:

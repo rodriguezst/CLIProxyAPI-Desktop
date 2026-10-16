@@ -13,6 +13,7 @@ func TestReadListenerLayouts(t *testing.T) {
 	}{
 		{"v8", "server:\n  host: 127.0.0.1\n  port: 9000\n", "http://127.0.0.1:9000", false},
 		{"legacy", "host: 0.0.0.0\nport: 8317\ntls:\n  enable: true\n", "https://127.0.0.1:8317", false},
+		{"TLS hostname", "server:\n  host: localhost\n  tls:\n    enable: true\n", "https://localhost:8317", false},
 		{"v8 wins", "host: wrong\nport: 42\nserver:\n  host: '::'\n  port: 9001\n", "http://[::1]:9001", false},
 		{"invalid port", "server:\n  port: 0\n", "", true},
 		{"wrong type", "server:\n  tls:\n    enable: garbage\n", "", true},

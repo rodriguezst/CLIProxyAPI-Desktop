@@ -155,7 +155,10 @@ def download(manifest, target, output):
         licenses.mkdir(exist_ok=True)
         (licenses / "CLIProxyAPI-LICENSE.txt").write_bytes(extract_member(archive, "LICENSE", 1024 * 1024))
         # Also pin and verify the source license recorded in the manifest.
-        if (licenses / "CLIProxyAPI-LICENSE.txt").read_bytes() != verified(manifest["core"]["license"]):
+        # Windows release checkouts use CRLF; compare license text after newline normalization.
+        archive_license = (licenses / "CLIProxyAPI-LICENSE.txt").read_bytes().replace(b"\r\n", b"\n")
+        source_license = verified(manifest["core"]["license"]).replace(b"\r\n", b"\n")
+        if archive_license != source_license:
             raise ValueError("release archive license differs from the pinned source license")
         (licenses / "Management-Center-LICENSE.txt").write_bytes(verified(manifest["panel"]["license"]))
         (output / "management.html").write_bytes(verified(manifest["panel"]["asset"]))

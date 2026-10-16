@@ -56,6 +56,24 @@ class UpstreamTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             upstream.asset_record({"name": "core.zip", "digest": "sha256:" + "a" * 64}, "b" * 64)
 
+    def test_windows_download_preserves_and_accepts_crlf_license(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("cli-proxy-api.exe", b"MZfixture")
+            output.writestr("config.example.yaml", b"server:\n  port: 8317\n")
+            output.writestr("LICENSE", b"MIT License\r\nfixture\r\n")
+        content = {"archive": archive.getvalue(), "license": b"MIT License\nfixture\n", "panel": b"<html>panel</html>"}
+        def record(key, name=""):
+            return {"name": name, "url": key, "sha256": upstream.digest(content[key])}
+        manifest = {"core": {"assets": {"windows-amd64": record("archive", "core.zip")}, "license": record("license")},
+                    "panel": {"asset": record("panel"), "license": record("license")}}
+        with tempfile.TemporaryDirectory() as directory, patch.object(upstream, "fetch", side_effect=lambda url: content[url]):
+            output = Path(directory)
+            upstream.download(manifest, "windows-amd64", output)
+            self.assertEqual((output / "cli-proxy-api.exe").read_bytes(), b"MZfixture")
+            self.assertEqual((output / "licenses/CLIProxyAPI-LICENSE.txt").read_bytes(), b"MIT License\r\nfixture\r\n")
+            self.assertFalse((output / "core.zip").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
