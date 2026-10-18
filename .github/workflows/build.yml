@@ -131,7 +131,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: failure-${{ matrix.target }}
-          path: build/smoke-failure.log
+          path: |
+            build/smoke-failure.log
+            build/installer-smoke/*.log
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:

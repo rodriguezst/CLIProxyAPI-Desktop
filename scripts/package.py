@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -192,12 +193,37 @@ def windows_installer(app, dist, name, target, version):
     return installer
 
 
+def wait_for_windows_uninstall(install, timeout=30):
+    # Inno Setup returns before its temporary clone deletes the original
+    # uninstaller. Observe that cleanup without deleting any installed files.
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            remaining = sorted(path.name for path in install.iterdir())
+        except FileNotFoundError:
+            return
+        except PermissionError as error:
+            detail = str(error)
+        else:
+            if not remaining:
+                return
+            detail = ", ".join(remaining[:10])
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"uninstaller returned success but cleanup did not finish within {timeout:g}s: {detail}")
+        time.sleep(0.1)
+
+
 def windows_installer_smoke(installer):
     # Only invoke a real installer on the disposable Actions host, never a
     # developer's machine where the same AppId may already be installed.
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return False
-    with tempfile.TemporaryDirectory(prefix="CPA installer smoke ") as temp:
+    logs = ROOT / "build" / "installer-smoke"
+    logs.mkdir(parents=True, exist_ok=True)
+    # A locked temporary file must not mask an installer or smoke-test failure.
+    # Successful uninstallation is checked separately before workspace cleanup.
+    with tempfile.TemporaryDirectory(prefix="CPA installer smoke ", ignore_cleanup_errors=True) as temp:
         root = Path(temp)
         install = root / "Installed App"
         profile = root / "Local App Data"
@@ -206,7 +232,8 @@ def windows_installer_smoke(installer):
         sentinel = data / "config.yaml"
         sentinel.write_text("# preserve existing user settings\n", encoding="utf-8")
         env = dict(os.environ, LOCALAPPDATA=str(profile))
-        run([installer, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", f"/DIR={install}"], env=env, timeout=120)
+        run([installer, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+             f"/DIR={install}", f"/LOG={logs / 'install.log'}"], env=env, timeout=120)
         launcher = install / "CLIProxyAPI Desktop.exe"
         if not launcher.is_file() or not (install / "resources/cli-proxy-api.exe").is_file():
             raise RuntimeError("installer did not deploy the application and bundled server")
@@ -214,8 +241,10 @@ def windows_installer_smoke(installer):
         uninstallers = list(install.glob("unins*.exe"))
         if len(uninstallers) != 1:
             raise RuntimeError("installer did not provide an uninstaller")
-        run([uninstallers[0], "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"], env=env, timeout=120)
-        if launcher.exists() or sentinel.read_text(encoding="utf-8") != "# preserve existing user settings\n":
+        run([uninstallers[0], "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+             f"/LOG={logs / 'uninstall.log'}"], env=env, timeout=120)
+        wait_for_windows_uninstall(install)
+        if sentinel.read_text(encoding="utf-8") != "# preserve existing user settings\n":
             raise RuntimeError("uninstall failed to remove program files or changed user data")
     return True
 
