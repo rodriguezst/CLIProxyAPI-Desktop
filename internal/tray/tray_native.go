@@ -5,22 +5,22 @@ package tray
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 
+	"cliproxyapi-desktop/internal/autostart"
 	"cliproxyapi-desktop/internal/bootstrap"
 	"cliproxyapi-desktop/internal/branding"
 	"cliproxyapi-desktop/internal/platform"
 	"cliproxyapi-desktop/internal/service"
 	"cliproxyapi-desktop/internal/settings"
-	"github.com/atotto/clipboard"
 	"github.com/getlantern/systray"
 )
 
-func Run(manager *service.Manager, paths settings.Paths, vault bootstrap.Vault, version string) error {
+func Run(manager *service.Manager, paths settings.Paths, startup *autostart.Manager, version string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	systray.Run(func() {
@@ -34,7 +34,12 @@ func Run(manager *service.Manager, paths settings.Paths, vault bootstrap.Vault, 
 		config := systray.AddMenuItem("Open Config Folder", "Show the folder containing config.yaml")
 		management := systray.AddMenuItem("Open Management UI", "Open management.html in your default browser")
 		management.Disable()
-		key := systray.AddMenuItem("Copy Management Key", "Copy the saved management login key")
+		key := systray.AddMenuItem("Reset Management Key…", "Choose a new key and update config.yaml")
+		enabled, err := startup.Enabled()
+		if err != nil {
+			go platform.Alert(err.Error())
+		}
+		startAtLogin := systray.AddMenuItemCheckbox("Start at Sign-in", "Start the tray and proxy when you sign in", enabled)
 		logs := systray.AddMenuItem("Open Logs Folder", "Show server logs")
 		lastError := systray.AddMenuItem("Show Last Error", "Show the last server failure")
 		lastError.Disable()
@@ -74,6 +79,8 @@ func Run(manager *service.Manager, paths settings.Paths, vault bootstrap.Vault, 
 			}()
 		}
 		go func() {
+			keyResult := make(chan error, 1)
+			startupResult := make(chan error, 1)
 			signals := make(chan os.Signal, 1)
 			signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 			defer signal.Stop(signals)
@@ -93,13 +100,41 @@ func Run(manager *service.Manager, paths settings.Paths, vault bootstrap.Vault, 
 						run(func() error { return platform.OpenURL(s.URL + "/management.html") })
 					}
 				case <-key.ClickedCh:
-					run(func() error {
-						value, err := vault.Get()
-						if err != nil {
-							return fmt.Errorf("no saved management key for this config; set management.secret-key in config.yaml: %w", err)
+					key.Disable()
+					go func() {
+						value, err := platform.ManagementKey(ctx, true)
+						if err == nil {
+							err = manager.UpdateConfig(ctx, func() error { return bootstrap.ResetManagementKey(paths.Config, value) })
 						}
-						return clipboard.WriteAll(value)
-					})
+						keyResult <- err
+					}()
+				case err := <-keyResult:
+					key.Enable()
+					if err != nil && !errors.Is(err, bootstrap.ErrCanceled) {
+						go platform.Alert(err.Error())
+					}
+				case <-startAtLogin.ClickedCh:
+					startAtLogin.Disable()
+					go func() {
+						enabled, err := startup.Enabled()
+						if err == nil {
+							err = startup.Set(!enabled)
+						}
+						startupResult <- err
+					}()
+				case err := <-startupResult:
+					startAtLogin.Enable()
+					if err != nil {
+						go platform.Alert(err.Error())
+					}
+					enabled, err := startup.Enabled()
+					if err == nil {
+						if enabled {
+							startAtLogin.Check()
+						} else {
+							startAtLogin.Uncheck()
+						}
+					}
 				case <-logs.ClickedCh:
 					run(func() error { return platform.OpenFolder(paths.Logs) })
 				case <-lastError.ClickedCh:

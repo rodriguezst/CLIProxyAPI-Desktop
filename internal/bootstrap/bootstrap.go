@@ -4,7 +4,6 @@ package bootstrap
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,46 +12,18 @@ import (
 	"path/filepath"
 
 	"cliproxyapi-desktop/internal/settings"
-	"github.com/zalando/go-keyring"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
 
-type Vault interface {
-	Get() (string, error)
-	Set(string) error
-}
-
-type SystemVault struct{ DataDir string }
-
-func (v SystemVault) account() string {
-	hash := sha256.Sum256([]byte(v.DataDir))
-	return hex.EncodeToString(hash[:16])
-}
-func (v SystemVault) Get() (string, error) { return keyring.Get("CLIProxyAPI-Desktop", v.account()) }
-func (v SystemVault) Set(value string) error {
-	return keyring.Set("CLIProxyAPI-Desktop", v.account(), value)
-}
-
-// MemoryVault is used only by the isolated packaged smoke test.
-type MemoryVault struct{ Key string }
-
-func (v *MemoryVault) Get() (string, error) {
-	if v.Key == "" {
-		return "", keyring.ErrNotFound
-	}
-	return v.Key, nil
-}
-func (v *MemoryVault) Set(key string) error { v.Key = key; return nil }
-
-func Initialize(p settings.Paths, vault Vault) error {
+func Initialize(p settings.Paths, prompt func() (string, error)) error {
 	for _, dir := range []string{p.Data, p.Static, p.Logs, filepath.Join(p.Data, "auths")} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create data directory: %w", err)
 		}
 	}
 	if _, err := os.Stat(p.Config); errors.Is(err, os.ErrNotExist) {
-		if err := createConfig(p, vault); err != nil {
+		if err := createConfig(p, prompt); err != nil {
 			return err
 		}
 	} else if err != nil {
@@ -61,7 +32,7 @@ func Initialize(p settings.Paths, vault Vault) error {
 	return updatePanel(filepath.Join(p.Resources, "management.html"), filepath.Join(p.Static, "management.html"))
 }
 
-func createConfig(p settings.Paths, vault Vault) error {
+func createConfig(p settings.Paths, prompt func() (string, error)) error {
 	data, err := os.ReadFile(filepath.Join(p.Resources, "config.example.yaml"))
 	if err != nil {
 		return fmt.Errorf("read bundled config template: %w", err)
@@ -73,15 +44,12 @@ func createConfig(p settings.Paths, vault Vault) error {
 	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("bundled config template is not a mapping")
 	}
-	key, err := vault.Get()
-	if errors.Is(err, keyring.ErrNotFound) {
-		key, err = randomKey()
-	}
+	key, err := prompt()
 	if err != nil {
-		return fmt.Errorf("read management key from OS credential store: %w", err)
+		return err
 	}
-	if err := vault.Set(key); err != nil {
-		return fmt.Errorf("save management key to OS credential store: %w", err)
+	if err := ValidateManagementKey(key); err != nil {
+		return err
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(key), bcrypt.DefaultCost)
 	if err != nil {

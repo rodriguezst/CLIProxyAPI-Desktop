@@ -4,6 +4,7 @@
 package instance
 
 import (
+	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"os"
@@ -20,7 +21,10 @@ func Acquire(dir string) (func() error, error) {
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("another CLIProxyAPI Desktop instance is using this data directory: %w", err)
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w: %v", ErrAlreadyRunning, err)
+		}
+		return nil, fmt.Errorf("lock data directory: %w", err)
 	}
 	return f.Close, nil
 }

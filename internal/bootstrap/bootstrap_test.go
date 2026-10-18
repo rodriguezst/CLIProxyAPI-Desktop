@@ -1,12 +1,13 @@
 package bootstrap
 
 import (
-	"cliproxyapi-desktop/internal/settings"
-	"golang.org/x/crypto/bcrypt"
-	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"cliproxyapi-desktop/internal/settings"
+	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v3"
 )
 
 func TestInitializeProtectsCredentialsAndPreservesConfig(t *testing.T) {
@@ -21,8 +22,10 @@ func TestInitializeProtectsCredentialsAndPreservesConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	vault := &MemoryVault{}
-	if err := Initialize(p, vault); err != nil {
+	key := "first user supplied management key"
+	prompts := 0
+	prompt := func() (string, error) { prompts++; return key, nil }
+	if err := Initialize(p, prompt); err != nil {
 		t.Fatal(err)
 	}
 	original, err := os.ReadFile(p.Config)
@@ -34,7 +37,7 @@ func TestInitializeProtectsCredentialsAndPreservesConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	secret := settings.Find(doc.Content[0], "management", "secret-key").Value
-	if err := bcrypt.CompareHashAndPassword([]byte(secret), []byte(vault.Key)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(secret), []byte(key)); err != nil {
 		t.Fatal("config does not contain the matching password hash")
 	}
 	if settings.Find(doc.Content[0], "access", "api-keys").Content[0].Value == "your-api-key-1" {
@@ -43,18 +46,17 @@ func TestInitializeProtectsCredentialsAndPreservesConfig(t *testing.T) {
 	if l, err := settings.Read(p.Config); err != nil || l.Host != "127.0.0.1" {
 		t.Fatalf("desktop listener is not loopback: %+v, %v", l, err)
 	}
-	key := vault.Key
-	if err := Initialize(p, vault); err != nil {
+	if err := Initialize(p, prompt); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadFile(p.Config)
-	if string(original) != string(after) || key != vault.Key {
+	if string(original) != string(after) || prompts != 1 {
 		t.Fatal("existing config or credentials changed")
 	}
 	if err := os.WriteFile(filepath.Join(p.Resources, "management.html"), []byte("<html>new bundled version</html>"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Initialize(p, vault); err != nil {
+	if err := Initialize(p, prompt); err != nil {
 		t.Fatal(err)
 	}
 	panel, err := os.ReadFile(filepath.Join(p.Static, "management.html"))
@@ -64,5 +66,19 @@ func TestInitializeProtectsCredentialsAndPreservesConfig(t *testing.T) {
 	after, _ = os.ReadFile(p.Config)
 	if string(original) != string(after) {
 		t.Fatal("panel upgrade modified user config")
+	}
+}
+
+func TestFirstRunCancellationDoesNotCreateConfig(t *testing.T) {
+	base := t.TempDir()
+	p := settings.Paths{Data: base, Config: filepath.Join(base, "config.yaml"), Static: filepath.Join(base, "static"), Logs: filepath.Join(base, "logs"), Resources: base}
+	if err := os.WriteFile(filepath.Join(base, "config.example.yaml"), []byte("server: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Initialize(p, func() (string, error) { return "", ErrCanceled }); err != ErrCanceled {
+		t.Fatal("cancellation was not returned:", err)
+	}
+	if _, err := os.Stat(p.Config); !os.IsNotExist(err) {
+		t.Fatal("cancellation created config.yaml")
 	}
 }

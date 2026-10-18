@@ -170,7 +170,12 @@ func Set(root *yaml.Node, value any, path ...string) error {
 		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: path[0]}, child)
 	}
 	if len(path) == 1 {
-		return child.Encode(value)
+		head, line, foot := child.HeadComment, child.LineComment, child.FootComment
+		if err := child.Encode(value); err != nil {
+			return err
+		}
+		child.HeadComment, child.LineComment, child.FootComment = head, line, foot
+		return nil
 	}
 	return Set(child, value, path[1:]...)
 }

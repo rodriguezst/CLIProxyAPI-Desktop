@@ -70,6 +70,10 @@ func (m *Manager) fail(err error) error {
 func (m *Manager) Start(ctx context.Context) error {
 	m.operation.Lock()
 	defer m.operation.Unlock()
+	return m.startLocked(ctx)
+}
+
+func (m *Manager) startLocked(ctx context.Context) error {
 	m.mu.Lock()
 	if m.done != nil {
 		m.mu.Unlock()
@@ -207,6 +211,24 @@ func (m *Manager) monitor(cmd *exec.Cmd, output io.ReadCloser, log *os.File, con
 }
 
 func (m *Manager) Stop() error { m.operation.Lock(); defer m.operation.Unlock(); return m.stopLocked() }
+
+// UpdateConfig serializes a local edit against start/stop and the server's watcher.
+// It restores the prior running state even when the edit fails.
+func (m *Manager) UpdateConfig(ctx context.Context, update func() error) error {
+	m.operation.Lock()
+	defer m.operation.Unlock()
+	m.mu.Lock()
+	wasRunning := m.done != nil
+	m.mu.Unlock()
+	if err := m.stopLocked(); err != nil {
+		return err
+	}
+	errUpdate := update()
+	if wasRunning {
+		return errors.Join(errUpdate, m.startLocked(ctx))
+	}
+	return errUpdate
+}
 func (m *Manager) stopLocked() error {
 	m.mu.Lock()
 	done, control := m.done, m.control

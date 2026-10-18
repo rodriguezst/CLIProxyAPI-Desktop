@@ -1,8 +1,8 @@
 package service
 
 import (
-	"cliproxyapi-desktop/internal/settings"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,7 +11,38 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"cliproxyapi-desktop/internal/settings"
 )
+
+func TestConfigEditStopsBeforeWritingAndRestoresRunningState(t *testing.T) {
+	p := testPaths(t)
+	marker := filepath.Join(p.Data, "signal.txt")
+	t.Setenv("CPA_FIXTURE_MARKER", marker)
+	m := New(p)
+	t.Cleanup(func() { _ = m.Stop() })
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	errEdit := errors.New("edit failed")
+	err := m.UpdateConfig(ctx, func() error {
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatal("server was not stopped before config edit")
+		}
+		return errEdit
+	})
+	if !errors.Is(err, errEdit) || m.Snapshot().State != Running {
+		t.Fatal("failed edit did not restore the running server:", err)
+	}
+	if err := m.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpdateConfig(ctx, func() error { return nil }); err != nil || m.Snapshot().State != Stopped {
+		t.Fatal("editing a stopped server started it")
+	}
+}
 
 var fixture, helper string
 

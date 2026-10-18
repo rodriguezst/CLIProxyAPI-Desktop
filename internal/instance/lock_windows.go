@@ -19,10 +19,16 @@ func Acquire(dir string) (func() error, error) {
 		if handle != 0 {
 			_ = windows.CloseHandle(handle)
 		}
-		return nil, fmt.Errorf("another CLIProxyAPI Desktop instance is using this data directory")
+		return nil, ErrAlreadyRunning
 	}
 	if err != nil {
 		return nil, err
 	}
-	return func() error { return windows.CloseHandle(handle) }, nil
+	installerName, _ := windows.UTF16PtrFromString(`Local\CLIProxyAPI-Desktop-Installer`)
+	installer, err := windows.CreateMutex(nil, false, installerName)
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		_ = windows.CloseHandle(handle)
+		return nil, err
+	}
+	return func() error { return errors.Join(windows.CloseHandle(installer), windows.CloseHandle(handle)) }, nil
 }
