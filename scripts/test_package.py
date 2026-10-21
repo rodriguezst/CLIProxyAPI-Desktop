@@ -7,6 +7,40 @@ from unittest.mock import patch
 import package
 
 
+class WindowsLauncherTests(unittest.TestCase):
+    def test_resource_is_used_by_build_and_removed_after_success_or_failure(self):
+        for arch in ("amd64", "arm64"):
+            for failure in (None, "resource", "launcher"):
+                with self.subTest(arch=arch, failure=failure), tempfile.TemporaryDirectory(prefix="launcher paths ") as directory:
+                    root = Path(directory)
+                    (root / "cmd/desktop").mkdir(parents=True)
+                    launcher = root / "App Files/CLIProxyAPI Desktop.exe"
+                    resource = root / "cmd/desktop" / f"appicon_windows_{arch}.syso"
+                    env = {"GOOS": "windows", "GOARCH": arch, "CGO_ENABLED": "0"}
+
+                    def build_run(args, **kwargs):
+                        if "github.com/akavel/rsrc" in args:
+                            self.assertEqual(args[args.index("-arch") + 1], arch)
+                            self.assertEqual(args[args.index("-ico") + 1], launcher.parent / "AppIcon.ico")
+                            self.assertEqual(args[args.index("-o") + 1], resource)
+                            resource.write_bytes(b"resource fixture")
+                            if failure == "resource":
+                                raise RuntimeError("resource generation failed")
+                        elif args[1] == "build":
+                            self.assertEqual(resource.read_bytes(), b"resource fixture")
+                            self.assertEqual(kwargs["env"], env)
+                            if failure == "launcher":
+                                raise RuntimeError("launcher build failed")
+
+                    with patch.object(package, "ROOT", root), patch.object(package, "run", side_effect=build_run):
+                        if failure:
+                            with self.assertRaisesRegex(RuntimeError, "failed"):
+                                package.build_windows_launcher(launcher, arch, "-H=windowsgui", env)
+                        else:
+                            package.build_windows_launcher(launcher, arch, "-H=windowsgui", env)
+                    self.assertFalse(resource.exists())
+
+
 class InstallerTests(unittest.TestCase):
     def test_installer_command_keeps_paths_and_architecture_as_arguments(self):
         with tempfile.TemporaryDirectory(prefix="installer paths ") as directory:

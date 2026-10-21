@@ -46,6 +46,20 @@ def smoke(launcher):
             probe.bind(("127.0.0.1", 8317))
 
 
+def build_windows_launcher(launcher, arch, flags, env):
+    icon = launcher.parent / "AppIcon.ico"
+    resource = ROOT / "cmd/desktop" / f"appicon_windows_{arch}.syso"
+    run(["go", "run", "./cmd/icon", "--out", icon], cwd=ROOT)
+    try:
+        # The pinned resource compiler is already present in go.mod.
+        run(["go", "run", "github.com/akavel/rsrc", "-arch", arch,
+             "-ico", icon, "-o", resource], cwd=ROOT)
+        run(["go", "build", "-trimpath", "-ldflags", flags, "-o", launcher, "./cmd/desktop"], cwd=ROOT, env=env)
+    finally:
+        # Do not leave generated architecture-specific resources in the source tree.
+        resource.unlink(missing_ok=True)
+
+
 def build(target, manifest, version):
     goos, arch = target.split("-", 1)
     native_os = {"Windows": "windows", "Darwin": "darwin", "Linux": "linux"}[platform.system()]
@@ -73,7 +87,9 @@ def build(target, manifest, version):
     flags = f"-s -w -X main.version={version}"
     if goos == "windows":
         flags += " -H=windowsgui"
-    run(["go", "build", "-trimpath", "-ldflags", flags, "-o", launcher, "./cmd/desktop"], cwd=ROOT, env=env)
+        build_windows_launcher(launcher, arch, flags, env)
+    else:
+        run(["go", "build", "-trimpath", "-ldflags", flags, "-o", launcher, "./cmd/desktop"], cwd=ROOT, env=env)
     run(["go", "build", "-trimpath", "-ldflags", "-s -w", "-o", helper, "./cmd/supervisor"], cwd=ROOT, env=env)
     shutil.copy2(ROOT / "LICENSE", resources / "licenses" / "Desktop-LICENSE.txt")
     # Include exact third-party module license files, including transitive modules.
@@ -105,8 +121,6 @@ def build(target, manifest, version):
                 name = f"icon_{size}x{size}" + ("@2x" if scale == 2 else "") + ".png"
                 run(["sips", "-z", size * scale, size * scale, png, "--out", iconset / name], stdout=subprocess.DEVNULL)
         run(["iconutil", "-c", "icns", iconset, "-o", resources / "AppIcon.icns"])
-    elif goos == "windows":
-        run(["go", "run", "./cmd/icon", "--out", app / "AppIcon.ico"], cwd=ROOT)
     return app, binary, launcher
 
 

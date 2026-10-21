@@ -6,6 +6,7 @@ require (
 	github.com/getlantern/systray v1.2.2
 	github.com/ncruces/zenity v0.10.15
 	golang.org/x/crypto v0.54.0
+	golang.org/x/image v0.44.0
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -24,5 +25,4 @@ require (
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/randall77/makefat v0.0.0-20260406194835-1b91746796b7 // indirect
 	github.com/stretchr/testify v1.9.0 // indirect
-	golang.org/x/image v0.44.0 // indirect
 )
